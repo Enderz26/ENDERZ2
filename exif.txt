@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# php_enumeration_automation.sh
+# A production-ready, modular Bash script to enumerate PHP files/endpoints during
+# an AUTHORIZED penetration test or security assessment.
+#
+# IMPORTANT: Run this ONLY against targets you have explicit permission to test.
+# This script is safe-by-default: non-destructive checks, passive discovery, and
+# optional "--aggressive" flag for deeper checks (still avoids destructive actions).
+#
+# Version: 1.3 — Safety & robustness fixes
+# - Fixed regex checks for HTTP status codes
+# - Fixed abs_path() function
+# - Guarded image analysis loop from empty-glob issues
+# - Initialized variables to avoid undefined-variable errors
+# - Short improvements to ffuf/gobuster status matching
+#
+# Usage example:
+#   ./php_enumeration_automation.sh -u "https://target.example" -w /path/wordlist.txt -o ./out --aggressive --img-analysis
+#
+# Author: ChatGPT (for authorized pentest use)
+set -euo pipefail
+IFS=$'\n\t'
+
+#########################
+# Default configuration #
+#########################
+PROG_NAME=$(basename "$0")
+OUTDIR="./php_enum_out"
+TARGET=""
+WORDLIST="/usr/share/wordlists/dirb/common.txt"
+PARAM_WORDLIST="/usr/share/wordlists/parameters.txt"
+THREADS=40
+AGGRESSIVE=false
+VERBOSE=false
+IMG_ANALYSIS=false
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOGFILE=""
+SAFE_LFI_TEST_STRING="__LFI_DETECT__"
+BACKUP_EXTENSIONS=(".bak" ".old" "~" ".save" ".swp" ".orig" ".backup" ".txt" ".inc" ".tar.gz")
+COMMON_PHP_FILES=("index.php" "admin.php" "login.php" "upload.php" "config.php" "db.php" "connect.php" "view.php" "download.php")
+IMAGE_EXTENSIONS=(".jpg" ".jpeg" ".png" ".gif" ".webp" ".bmp" ".tiff")
+
+#########################
+# Helper / Utility fn  #
+#########################
+log() {
+  local lvl="$1"; shift
+  local msg="$*"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts] [$lvl] $msg"
+  if [[ -n "$LOGFILE" ]]; then
+    echo "[$ts] [$lvl] $msg" >> "$LOGFILE"
+  fi
+}
+
+usage() {
+  cat <<EOF
+$PROG_NAME - Automated PHP enumeration toolkit (safe-by-default)
+
+Usage: $PROG_NAME -u <target_url> [options]
+
+Options:
+  -u, --url            TARGET URL (e.g. https://example.com)
+  -w, --wordlist       Path to directory wordlist for directory brute force
+  -p, --param-wl       Path to parameter wordlist (for ffuf/arjun)
+  -o, --outdir         Output directory (default: ./php_enum_out)
+  -t, --threads        Threads/concurrency for ffuf/gobuster (default: 40)
+  --aggressive         Enable additional checks (nikto, deeper fuzzing). Use only if authorized.
+  --img-analysis       Run lightweight image artifact analysis on discovered image files
+  -v, --verbose        Verbose logging
+  -h, --help           Show this help
+
+Example:
+  $PROG_NAME -u https://target.example -w /path/dirs.txt -p /path/params.txt -o ./out --aggressive --img-analysis
+
+Note: Run this only on systems you have permission to test.
+EOF
+  exit 1
+}
+
+check_tool() {
+  local name="$1"
+  if ! command -v "$name" &>/dev/null; then
+    log WARN "$name not found in PATH"
+    return 1
+  fi
+  log DEBUG "$name found"
+  return 0
+}
+
+ensure_tools() {
+  local missing=()
+  # Minimal recommended tools
+  local tools=(curl whatweb ffuf gobuster arjun nikto)
+  for t in "${tools[@]}"; do
+    if ! check_tool "$t"; then
+      missing+=("$t")
+    fi
+  done
+  if [[ "$IMG_ANALYSIS" == true ]]; then
+    for t in exiftool identify binwalk foremost photorec; do
+      if ! check_tool "$t"; then
+        missing+=("$t")
+      fi
+    done
+  fi
+  if [[ ${#missing[@]} -ne 0 ]]; then
+    log WARN "Missing tools: ${missing[*]}"
+    log INFO "Install them (examples):"
+    echo
+    echo "Debian/Ubuntu: sudo apt update && sudo apt install curl whatweb ffuf gobuster nikto foremost binwalk libimage-exiftool-perl imagemagick testdisk -y"
+    echo "pip3 install arjun"
+    echo
+    log INFO "Script will continue but features requiring missing tools will be skipped."
+  fi
+}
+
+mkdir_p() {
+  local d="$1"
+  if [[ ! -d "$d" ]]; then
+    mkdir -p "$d"
+  fi
+}
+
+safe_url_normalize() {
+  # Ensure URL has scheme
+  local u="$1"
+  if [[ "$u" != http*://* ]]; then
+    u="http://$u"
+  fi
+  # remove trailing slash
+  u="${u%/}"
+  echo "$u"
+}
+
+abs_path() {
+  # Return absolute path for a given argument
+  if command -v python3 &>/dev/null; then
+    python3 - <<PY -- "$1"
+import os,sys
+print(os.path.abspath(sys.argv[1]))
+PY
+  else
+    # Fallback: use builtin (may fail for relative symlinks)
+    (cd "$(dirname -- "$1")" && printf "%s/%s\n" "$(pwd -P)" "$(basename -- "$1")")
+  fi
+}
+
+#########################
+# Discovery functions   #
+#########################
+run_whatweb() {
+  if ! command -v whatweb &>/dev/null; then
+    log WARN "whatweb not installed, skipping fingerprinting"
+    return
+  fi
+  log INFO "Running whatweb (tech fingerprinting)..."
+  whatweb --no-errors -v --log-verbose "$OUTDIR/whatweb.txt" "$TARGET" || true
+}
+
+run_gobuster_dirs() {
+  if ! command -v gobuster &>/dev/null; then
+    log WARN "gobuster not found, skipping directory brute-force"
+    return
+  fi
+  log INFO "Running gobuster (directory bruteforce) against $TARGET ..."
+  gobuster dir -u "$TARGET" -w "$WORDLIST" -t "$THREADS" -x php,php5,html,txt,inc,bak -s 200,204,301,302,403 -o "$OUTDIR/gobuster_dirs.txt" || true
+}
+
+run_ffuf_params() {
+  if ! command -v ffuf &>/dev/null; then
+    log WARN "ffuf not found, skipping parameter fuzzing"
+    return
+  fi
+  log INFO "Running ffuf parameter fuzzing (common params)..."
+  local paramfile="$PARAM_WORDLIST"
+  if [[ ! -f "$paramfile" ]]; then
+    paramfile="$OUTDIR/simple_params.txt"
+    cat > "$paramfile" <<EOP
+id
+page
+file
+view
+user
+username
+password
+action
+type
+lang
+langid
+cat
+sort
+debug
+EOP
+  fi
+  # match common positive statuses (2xx and 3xx)
+  ffuf -w "$paramfile" -u "$TARGET?FUZZ=1" -mc 200,201,202,203,204,301,302 -t 20 -o "$OUTDIR/ffuf_params.json" -of json || true
+}
+
+run_arjun() {
+  if ! command -v arjun &>/dev/null; then
+    log WARN "arjun not installed, skipping parameter discovery"
+    return
+  fi
+  log INFO "Running arjun (parameter discovery) on $TARGET ..."
+  arjun -u "$TARGET" -oT "$OUTDIR/arjun_params.txt" || true
+}
+
+collect_headers() {
+  log INFO "Collecting HTTP headers and cookies..."
+  curl -sI -L "$TARGET" > "$OUTDIR/curl_headers.txt" || true
+}
+
+probe_common_php_files() {
+  log INFO "Probing for a set of common PHP filenames..."
+  for f in "${COMMON_PHP_FILES[@]}"; do
+    local url="$TARGET/$f"
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" -L "$url" || echo "000")
+    echo "$status    $url" >> "$OUTDIR/common_php_probe.txt"
+  done
+}
+
+probe_backup_files() {
+  log INFO "Probing for common backup/temp files (conservative)..."
+  local candidate_urls=()
+  local paths=()
+  if [[ -f "$OUTDIR/gobuster_dirs.txt" ]]; then
+    mapfile -t paths < <(awk '{print $1}' "$OUTDIR/gobuster_dirs.txt" | sed 's#^/##' | sed '/^$/d') || true
+  fi
+  candidate_urls+=("")
+  for p in "${paths[@]:-}"; do
+    candidate_urls+=("$p")
+  done
+
+  for base in "${candidate_urls[@]}"; do
+    for ext in "${BACKUP_EXTENSIONS[@]}"; do
+      local url1="$TARGET/${base}index.php${ext}"
+      local url2="$TARGET/${base}.php${ext}"
+      for u in "$url1" "$url2"; do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" -L "$u" || echo "000")
+        if [[ "$code" =~ ^[23] ]]; then
+          echo "$code    $u" >> "$OUTDIR/backup_probe.txt"
+        fi
+      done
+    done
+  done
+}
+
+safe_lfi_probe() {
+  if ! command -v curl &>/dev/null; then
+    log WARN "curl missing, skipping LFI checks"
+    return
+  fi
+  log INFO "Running safe LFI detection (non-destructive)..."
+  local candidates=(
+    "$TARGET/view.php"
+    "$TARGET/download.php"
+    "$TARGET/file.php"
+    "$TARGET/index.php"
+  )
+  if [[ -f "$OUTDIR/common_php_probe.txt" ]]; then
+    while read -r line; do
+      url=$(echo "$line" | awk '{print $2}')
+      candidates+=("$url")
+    done < "$OUTDIR/common_php_probe.txt"
+  fi
+
+  for url in "${candidates[@]}"; do
+    local test_param="../../${SAFE_LFI_TEST_STRING}.txt"
+    for p in file path page view include tpl template; do
+      local fullurl="${url}?${p}=${test_param}"
+      local body
+      body=$(curl -s -L "$fullurl" || true)
+      if [[ -n "$body" ]]; then
+        if echo "$body" | grep -qiE "(failed to open stream|No such file or directory|open\\(\\).*failed|include\\(\\).+failed)"; then
+          echo "POTENTIAL_LFI: $fullurl" >> "$OUTDIR/potential_lfi.txt"
+        fi
+      fi
+    done
+  done
+}
+
+run_nikto() {
+  if [[ "$AGGRESSIVE" != true ]]; then
+    log INFO "Nikto scan disabled (use --aggressive to enable)"
+    return
+  fi
+  if ! command -v nikto &>/dev/null; then
+    log WARN "nikto not installed, skipping"
+    return
+  fi
+  log INFO "Running nikto (web server scan) — aggressive checks enabled"
+  nikto -h "$TARGET" -output "$OUTDIR/nikto.txt" || true
+}
+
+#########################
+# Image analysis fns    #
+#########################
+collect_images_from_gobuster() {
+  # This function attempts to download common image files discovered by gobuster
+  if [[ ! -f "$OUTDIR/gobuster_dirs.txt" ]]; then
+    return
+  fi
+  log INFO "Looking for candidate image paths in gobuster results..."
+  mkdir_p "$OUTDIR/images"
+  awk '{print $1}' "$OUTDIR/gobuster_dirs.txt" | while read -r path; do
+    for ext in "${IMAGE_EXTENSIONS[@]}"; do
+      # craft potential image URL
+      # path may already include leading slash
+      url="$TARGET${path%/}$ext"
+      # try a HEAD request to check existence
+      code=$(curl -sI -L "$url" -o /dev/null -w "%{http_code}" || echo "000")
+      if [[ "$code" =~ ^[23] ]]; then
+        outname="$OUTDIR/images/$(echo "$url" | sed 's#https\\?://##' | tr '/:' '_')"
+        log INFO "Downloading candidate image: $url -> $outname"
+        curl -s -L "$url" -o "$outname" || true
+      fi
+    done
+  done || true
+}
+
+run_image_analysis_on_dir() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    return
+  fi
+  # guard against empty glob expansion
+  shopt -s nullglob
+  local imgs=("$dir"/*)
+  shopt -u nullglob
+  if [[ ${#imgs[@]} -eq 0 ]]; then
+    log INFO "No images to analyze in $dir"
+    return
+  fi
+  for img in "${imgs[@]}"; do
+    [[ -f "$img" ]] || continue
+    log INFO "Analyzing image: $img"
+    # exiftool (metadata)
+    if command -v exiftool &>/dev/null; then
+      exiftool "$img" > "$img.exif.txt" || true
+    fi
+    # ImageMagick identify
+    if command -v identify &>/dev/null; then
+      identify -verbose "$img" > "$img.identify.txt" 2>/dev/null || true
+    fi
+    # binwalk (carving embedded files)
+    if command -v binwalk &>/dev/null; then
+      binwalk -e "$img" -C "$OUTDIR/images/binwalk_$(basename "$img")" || true
+    fi
+    # foremost carving
+    if command -v foremost &>/dev/null; then
+      mkdir -p "$OUTDIR/images/foremost_$(basename "$img")"
+      foremost -v -i "$img" -o "$OUTDIR/images/foremost_$(basename "$img")" || true
+    fi
+  done
+}
+
+run_photorec_if_present() {
+  if command -v photorec &>/dev/null; then
+    log INFO "photorec available. NOTE: photorec is interactive and heavy-handed."
+    log INFO "If you want to run photorec manually on $1, run: photorec $1"
+  fi
+}
+
+summarize_results() {
+  log INFO "Summarizing findings into $OUTDIR/summary.txt"
+  {
+    echo "PHP Enumeration Summary - Generated: $(date)"
+    echo "Target: $TARGET"
+    echo
+    echo "-- Headers (curl) --"
+    [[ -f "$OUTDIR/curl_headers.txt" ]] && sed -n '1,120p' "$OUTDIR/curl_headers.txt" || echo "(no headers)"
+    echo
+    echo "-- Common PHP probes --"
+    [[ -f "$OUTDIR/common_php_probe.txt" ]] && cat "$OUTDIR/common_php_probe.txt" || echo "(none)"
+    echo
+    echo "-- Potential backup/temp files --"
+    [[ -f "$OUTDIR/backup_probe.txt" ]] && cat "$OUTDIR/backup_probe.txt" || echo "(none)"
+    echo
+    echo "-- Potential LFI indicators --"
+    [[ -f "$OUTDIR/potential_lfi.txt" ]] && cat "$OUTDIR/potential_lfi.txt" || echo "(none)"
+    echo
+    echo "-- Gobuster results (top 200 lines) --"
+    [[ -f "$OUTDIR/gobuster_dirs.txt" ]] && sed -n '1,200p' "$OUTDIR/gobuster_dirs.txt" || echo "(none)"
+    echo
+    echo "-- Arjun discovered params --"
+    [[ -f "$OUTDIR/arjun_params.txt" ]] && sed -n '1,200p' "$OUTDIR/arjun_params.txt" || echo "(none)"
+    echo
+    echo "-- FFUF parameter fuzz results (raw json) --"
+    [[ -f "$OUTDIR/ffuf_params.json" ]] && echo "(see $OUTDIR/ffuf_params.json)" || echo "(none)"
+    echo
+    echo "-- Image artifacts (images/) --"
+    [[ -d "$OUTDIR/images" ]] && ls -la "$OUTDIR/images" || echo "(none)"
+  } > "$OUTDIR/summary.txt"
+}
+
+#########################
+# Main workflow         #
+#########################
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--url)
+      TARGET="$2"; shift 2;;
+    -w|--wordlist)
+      WORDLIST="$2"; shift 2;;
+    -p|--param-wl)
+      PARAM_WORDLIST="$2"; shift 2;;
+    -o|--outdir)
+      OUTDIR="$2"; shift 2;;
+    -t|--threads)
+      THREADS="$2"; shift 2;;
+    --aggressive)
+      AGGRESSIVE=true; shift;;
+    --img-analysis)
+      IMG_ANALYSIS=true; shift;;
+    -v|--verbose)
+      VERBOSE=true; shift;;
+    -h|--help)
+      usage;;
+    *)
+      echo "Unknown arg: $1"; usage;;
+  esac
+done
+
+if [[ -z "$TARGET" ]]; then
+  log ERROR "Target URL not provided"
+  usage
+fi
+
+TARGET=$(safe_url_normalize "$TARGET")
+OUTDIR="${OUTDIR%/}/php_enum_${TIMESTAMP}"
+LOGFILE="$OUTDIR/run.log"
+mkdir_p "$OUTDIR"
+
+if [[ "$VERBOSE" == true ]]; then
+  set -x
+fi
+
+log INFO "Starting PHP enumeration for $TARGET"
+log INFO "Output will be stored in: $OUTDIR"
+
+ensure_tools
+collect_headers
+run_whatweb
+probe_common_php_files
+run_gobuster_dirs
+probe_backup_files
+run_arjun
+run_ffuf_params
+safe_lfi_probe
+run_nikto
+
+if [[ "$IMG_ANALYSIS" == true ]]; then
+  collect_images_from_gobuster
+  run_image_analysis_on_dir "$OUTDIR/images"
+  run_photorec_if_present "$OUTDIR/images"
+fi
+
+summarize_results
+
+# Print absolute output path for convenience
+if command -v python3 &>/dev/null; then
+  abs=$(python3 -c "import os,sys; print(os.path.abspath(\"$OUTDIR\"))")
+  log INFO "Absolute output path: $abs"
+else
+  log INFO "Output path: $OUTDIR"
+fi
+
+log INFO "Done. Results written under $OUTDIR"
+log INFO "Please review $OUTDIR/summary.txt for a quick overview"
+log INFO "Remember: Only perform further intrusive testing with explicit authorization."
+
+# End of script
