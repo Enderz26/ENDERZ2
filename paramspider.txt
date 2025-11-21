@@ -1,0 +1,7 @@
+instation
+
+git clone https://github.com/devanshbatham/paramspider
+cd paramspider
+pip install 
+
+paramspider -d keralamatrimony.com
